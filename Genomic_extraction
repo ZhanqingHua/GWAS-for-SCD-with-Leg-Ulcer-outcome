@@ -1,0 +1,260 @@
+import sys
+from datetime import datetime
+import hail as hl
+
+
+# 1. Add AoU tutorial utility functions to Python path
+
+
+sys.path.append(
+    "/home/dataproc/workspace/aou-tutorial-notebooks/"
+    "03_Getting_Started_with_Genomic_Data/"
+    "06_Genomic_Data_Extraction"
+)
+
+from genomics_utils import (
+    load_matrix_table,
+    recompute_call_stats,
+    filter_mt_by_intervals,
+)
+
+print("genomics_utils imported successfully")
+
+
+
+# 2. Define paths
+
+
+GOOGLE_PROJECT_ID = "wb-rapid-grape-7347"
+
+BUCKET = "gs://sicklecell-icd-wgs-wb-rapid-grape-7347"
+
+MT_PATH = (
+    "gs://vwb-aou-datasets-controlled/"
+    "v9/wgs/short_read/snpindel/acaf_threshold/splitMT/hail.mt"
+)
+
+KEEP_PATH = (
+    f"{BUCKET}/gwas/keep_n665.txt"
+)
+
+OUT_PATH = (
+    f"{BUCKET}/gwas/mt_n665/chr15_n665.mt"
+)
+
+
+
+# 3. Initialize Hail
+
+
+hl.init(
+    gcs_requester_pays_configuration=GOOGLE_PROJECT_ID,
+    tmp_dir=f"{BUCKET}/hail-tmp"
+)
+
+hl.default_reference(new_default_reference="GRCh38")
+
+print("Hail initialized")
+print("Hail version:", hl.__version__)
+
+
+
+# 4. Load your 665 participant IDs
+
+keep_ht = hl.import_table(
+    KEEP_PATH,
+    impute=True
+)
+
+sample_ht = (
+    keep_ht
+    .select(s=hl.str(keep_ht.IID))
+    .key_by("s")
+)
+
+print("Sample table prepared")
+
+
+
+# 5. Load AoU ACAF MatrixTable
+
+
+start = datetime.now()
+
+mt = load_matrix_table(
+    MT_PATH,
+    show_info=False
+)
+
+print("MatrixTable loaded")
+print("Row key:", mt.row_key)
+print("Column key:", mt.col_key)
+
+
+# 6. Restrict to chromosome 20
+
+
+
+mt = filter_mt_by_intervals(
+    mt,
+    ["chr15"],
+    keep=True,
+    reference_genome="GRCh38"
+)
+
+print("chr15 interval selected")
+
+
+
+# 7. Restrict to your 665 participants
+
+
+mt_subset = mt.semi_join_cols(sample_ht)
+
+print("chr15 + 665-sample subset defined")
+
+
+# 8. Recompute AC / AF / AN after sample filtering
+
+
+mt_subset = recompute_call_stats(
+    mt_subset
+)
+
+print("Call statistics recomputed")
+
+
+
+# 9. Remove variants absent in your 665 participants
+
+
+mt_subset = mt_subset.filter_rows(
+    mt_subset.info.AC[1] > 0
+)
+
+print("AC=0 variants removed")
+
+
+
+# 10. Write chr20 MatrixTable to your workspace bucket
+
+
+print("Writing chr15 MatrixTable to:")
+print(OUT_PATH)
+
+mt_subset.write(
+    OUT_PATH,
+    overwrite=True
+)
+
+
+# 11. Done
+
+
+print("chr15 finished successfully")
+print("Elapsed time:", datetime.now() - start)
+import sys
+from datetime import datetime
+import hail as hl
+
+
+sys.path.append(
+    "/home/dataproc/workspace/aou-tutorial-notebooks/"
+    "03_Getting_Started_with_Genomic_Data/"
+    "06_Genomic_Data_Extraction"
+)
+
+from genomics_utils import (
+    load_matrix_table,
+    recompute_call_stats,
+    filter_mt_by_intervals,
+)
+
+print("genomics_utils imported successfully")
+
+
+
+BUCKET = "gs://sicklecell-icd-wgs-wb-rapid-grape-7347"
+
+MT_PATH = (
+    "gs://vwb-aou-datasets-controlled/"
+    "v9/wgs/short_read/snpindel/acaf_threshold/splitMT/hail.mt"
+)
+
+KEEP_PATH = f"{BUCKET}/gwas/keep_n665.txt"
+
+OUT_PATH = f"{BUCKET}/gwas/mt_n665/chr15_n665.mt"
+
+
+print("Hail version:", hl.__version__)
+print("Default reference:", hl.default_reference())
+
+
+keep_ht = hl.import_table(
+    KEEP_PATH,
+    impute=True
+)
+
+sample_ht = (
+    keep_ht
+    .select(s=hl.str(keep_ht.IID))
+    .key_by("s")
+)
+
+print("Sample table prepared")
+
+
+
+start = datetime.now()
+
+mt = load_matrix_table(
+    MT_PATH,
+    show_info=False
+)
+
+print("MatrixTable loaded")
+print("Row key:", mt.row_key)
+print("Column key:", mt.col_key)
+
+
+
+mt = filter_mt_by_intervals(
+    mt,
+    ["chr15"],
+    keep=True,
+    reference_genome="GRCh38"
+)
+
+print("chr15 interval selected")
+
+
+
+mt_subset = mt.semi_join_cols(sample_ht)
+
+print("chr15 + 665-sample subset defined")
+
+
+mt_subset = recompute_call_stats(mt_subset)
+
+print("Call statistics recomputed")
+
+
+
+mt_subset = mt_subset.filter_rows(
+    mt_subset.info.AC[1] > 0
+)
+
+print("AC=0 variants removed")
+
+print("Writing chr15 MatrixTable to:")
+print(OUT_PATH)
+
+mt_subset.write(
+    OUT_PATH,
+    overwrite=True
+)
+
+
+
+print("chr15 finished successfully")
+print("Elapsed time:", datetime.now() - start)
