@@ -1,0 +1,389 @@
+import logging
+import os
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+
+import hail as hl
+import numpy as np
+import pandas as pd
+import requests
+from tqdm.auto import tqdm
+
+
+#1. CONFIGURATION — ONLY CHR 1-21 (CHR22 ALREADY COMPLETED)
+
+BUCKET = "gs://sicklecell-icd-wgs-wb-rapid-grape-7347"
+INPUT_DIR = f"{BUCKET}/gwas/mt_n665"
+PHENO_GCS = f"{BUCKET}/gwas/input/phenotype_leg_ulcer_n665.csv"
+COVAR_GCS = f"{BUCKET}/gwas/input/SCD_GWAS_covar_HU_withAge.tsv"
+
+CHROMOSOMES = list(range(19, 22))  
+RESULT_DIR = f"{BUCKET}/gwas/results/firth_age_chr1_21_v1"
+RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+LOCAL_DIR = f"/tmp/scd_gwas_chr1_21_{RUN_ID}"
+os.makedirs(LOCAL_DIR, exist_ok=True)
+
+MAX_MISSINGNESS = 0.15
+MIN_MAF = 0.01
+MONITOR_INTERVAL_SECONDS = 15
+SKIP_COMPLETED = True
+
+
+#2. LOGGING
+
+log = logging.getLogger(f"SCD_FIRTH_CHR1_21_{RUN_ID}")
+log.setLevel(logging.INFO)
+log.propagate = False
+formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+console = logging.StreamHandler(sys.stdout)
+console.setFormatter(formatter)
+log.addHandler(console)
+local_log = f"{LOCAL_DIR}/gwas_chr1_21_progress.log"
+file_handler = logging.FileHandler(local_log)
+file_handler.setFormatter(formatter)
+log.addHandler(file_handler)
+
+
+def copy_gcs(src, dst):
+    subprocess.run(["gsutil", "cp", src, dst], check=True)
+
+
+def gcs_exists(path):
+    result = subprocess.run(
+        ["gsutil", "-q", "stat", path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def get_id_column(df):
+    for name in ("IID", "person_id", "sample_id"):
+        if name in df.columns:
+            return name
+    raise ValueError("Cannot find IID, person_id, or sample_id column")
+
+
+def normalize_id(series):
+    return series.astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+
+
+def marker_gcs(chrom):
+    return f"{RESULT_DIR}/chr{chrom}_firth.complete.txt"
+
+
+def confirmed_result(chrom):
+    """Return the recorded result path only when marker AND result both exist."""
+    proc = subprocess.run(
+        ["gsutil", "cat", marker_gcs(chrom)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    result_path = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
+    if result_path.startswith(f"{RESULT_DIR}/chr{chrom}_firth_") and gcs_exists(result_path):
+        return result_path
+    log.warning("chr%s has a completion marker but no matching output; rerunning", chrom)
+    return None
+
+
+def mark_completed(chrom, output_gcs):
+    marker_local = f"{LOCAL_DIR}/chr{chrom}_firth.complete.txt"
+    with open(marker_local, "w", encoding="utf-8") as handle:
+        handle.write(output_gcs + "\n")
+    copy_gcs(marker_local, marker_gcs(chrom))
+
+
+
+#3. MONITOR ONLY JOBS LAUNCHED DURING EACH CHROMOSOME
+
+def start_monitor(sc, chrom):
+    """Monitor new jobs; exclude jobs that existed before this chromosome."""
+    stop = threading.Event()
+    if not sc.uiWebUrl:
+        log.warning("chr%s: Spark UI unavailable; milestone logs still work", chrom)
+        return stop, None
+
+    root = f"{sc.uiWebUrl.rstrip('/')}/api/v1/applications/{sc.applicationId}"
+    session = requests.Session()
+    try:
+        response = session.get(f"{root}/jobs", timeout=8)
+        response.raise_for_status()
+        baseline = {int(job["jobId"]) for job in response.json()}
+        log.info("chr%s: Spark monitor excluding %s earlier jobs", chrom, len(baseline))
+    except Exception as exc:
+        log.warning("chr%s: Cannot start Spark monitor: %s", chrom, exc)
+        session.close()
+        return stop, None
+
+    def watch():
+        seen = {}
+        try:
+            while not stop.wait(MONITOR_INTERVAL_SECONDS):
+                try:
+                    jobs_response = session.get(f"{root}/jobs", timeout=10)
+                    jobs_response.raise_for_status()
+                    current = [
+                        job for job in jobs_response.json()
+                        if int(job["jobId"]) not in baseline
+                        and job.get("status") == "RUNNING"
+                    ]
+                    if not current:
+                        continue
+                    stages_response = session.get(f"{root}/stages", timeout=10)
+                    stages_response.raise_for_status()
+                    stages = stages_response.json()
+                    for job in current:
+                        job_id = int(job["jobId"])
+                        included = set(job.get("stageIds") or [])
+                        for stage in stages:
+                            stage_id = stage.get("stageId")
+                            if stage_id not in included or stage.get("status") != "ACTIVE":
+                                continue
+                            done = int(stage.get("numCompleteTasks") or 0)
+                            total = int(stage.get("numTasks") or 0)
+                            running = int(stage.get("numActiveTasks") or 0)
+                            failed = int(stage.get("numFailedTasks") or 0)
+                            state = (done, total, running, failed)
+                            key = (job_id, stage_id)
+                            if seen.get(key) == state:
+                                continue
+                            seen[key] = state
+                            pct = 100 * done / total if total else 0
+                            log.info(
+                                "[CHR%s SPARK] Job %s Stage %s: %s/%s tasks "
+                                "(%.1f%%), running=%s, failed=%s",
+                                chrom, job_id, stage_id, done, total, pct, running, failed,
+                            )
+                except Exception as exc:
+                    log.warning("chr%s: Spark monitor warning: %s", chrom, str(exc)[:120])
+        finally:
+            session.close()
+
+    thread = threading.Thread(target=watch, daemon=True)
+    thread.start()
+    return stop, thread
+
+
+
+# 4. LOAD CLINICAL DATA ONCE
+
+def build_clinical_table():
+    pheno_local = f"{LOCAL_DIR}/phenotype_leg_ulcer_n665.csv"
+    covar_local = f"{LOCAL_DIR}/SCD_GWAS_covar_HU_withAge.tsv"
+    log.info("Downloading phenotype and covariates once for all 21 chromosomes")
+    copy_gcs(PHENO_GCS, pheno_local)
+    copy_gcs(COVAR_GCS, covar_local)
+
+    pheno = pd.read_csv(pheno_local, dtype=str)
+    covar = pd.read_csv(covar_local, sep="\t", dtype=str)
+    phenotype_col = "PHENOTYPE"
+    if phenotype_col not in pheno.columns:
+        raise ValueError("Phenotype file must contain uppercase PHENOTYPE column")
+
+    pheno["sample_id"] = normalize_id(pheno[get_id_column(pheno)])
+    covar["sample_id"] = normalize_id(covar[get_id_column(covar)])
+    if (pheno["sample_id"].isna().any() or covar["sample_id"].isna().any()
+            or not pheno["sample_id"].is_unique or not covar["sample_id"].is_unique):
+        raise ValueError("Sample IDs must be present and unique")
+
+    excluded = {"FID", "IID", "person_id", "sample_id", "phenotype", "PHENO", "PHENOTYPE"}
+    covariate_cols = [col for col in covar.columns if col not in excluded]
+    if not covariate_cols:
+        raise ValueError("No covariates found")
+    for col in covariate_cols:
+        covar[col] = pd.to_numeric(covar[col], errors="raise")
+    pheno[phenotype_col] = pd.to_numeric(pheno[phenotype_col], errors="raise")
+
+    analysis = pheno[["sample_id", phenotype_col]].merge(
+        covar[["sample_id"] + covariate_cols],
+        on="sample_id", how="inner", validate="one_to_one",
+    )
+    numeric_cols = [phenotype_col] + covariate_cols
+    analysis[numeric_cols] = analysis[numeric_cols].replace([np.inf, -np.inf], np.nan)
+    analysis = analysis.dropna(subset=numeric_cols).copy()
+    if not set(analysis[phenotype_col].unique()).issubset({0, 1}):
+        raise ValueError("PHENOTYPE must be 0/1")
+    n = len(analysis)
+    cases = int((analysis[phenotype_col] == 1).sum())
+    controls = n - cases
+    if cases == 0 or controls == 0:
+        raise ValueError("Analysis needs both cases and controls")
+    for col in covariate_cols:
+        if analysis[col].nunique() <= 1:
+            raise ValueError(f"Covariate {col} has no variation")
+    design = np.column_stack([
+        np.ones(n), analysis[covariate_cols].to_numpy(dtype=float),
+    ])
+    if np.linalg.matrix_rank(design) < design.shape[1]:
+        raise ValueError("Covariate matrix is rank deficient")
+
+    log.info("Clinical cohort: %s samples; %s cases; %s controls", n, cases, controls)
+    log.info("Covariates: %s", covariate_cols)
+    analysis["sample_id"] = analysis["sample_id"].astype(str)
+    ht = hl.Table.from_pandas(
+        analysis[["sample_id", phenotype_col] + covariate_cols],
+        key="sample_id",
+    )
+    log.info("Hail clinical table READY")
+    return ht, phenotype_col, covariate_cols, n
+
+
+
+# 5. RUN EXACTLY ONE CHROMOSOME
+
+def run_chromosome(chrom, ht, phenotype_col, covariate_cols, expected_n, sc):
+    started = time.time()
+    mt_path = f"{INPUT_DIR}/chr{chrom}_n665.mt"
+    
+    attempt_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output_gcs = f"{RESULT_DIR}/chr{chrom}_firth_{attempt_id}.tsv.bgz"
+    log.info("=" * 65)
+    log.info("CHR %s STARTED | input=%s", chrom, mt_path)
+    log.info("CHR %s OUTPUT | %s", chrom, output_gcs)
+
+    monitor_stop, monitor_thread = start_monitor(sc, chrom)
+    try:
+        log.info("chr%s STEP 1/5: Reading MatrixTable metadata", chrom)
+        mt = hl.read_matrix_table(mt_path)
+        log.info("chr%s STEP 1/5: MatrixTable object loaded", chrom)
+        mt = mt.select_rows().select_entries("GT")
+
+        log.info("chr%s STEP 2/5: Matching clinical samples", chrom)
+        mt = mt.annotate_cols(clinical=ht[mt.s])
+        mt = mt.filter_cols(hl.is_defined(mt.clinical))
+        summary = mt.aggregate_cols(hl.struct(
+            n=hl.agg.count(),
+            cases=hl.agg.count_where(mt.clinical.PHENOTYPE == 1),
+            controls=hl.agg.count_where(mt.clinical.PHENOTYPE == 0),
+        ))
+        log.info(
+            "chr%s genotype-matched cohort: %s samples, %s cases, %s controls",
+            chrom, summary.n, summary.cases, summary.controls,
+        )
+        if summary.n != expected_n:
+            raise ValueError(
+                f"chr{chrom}: only {summary.n}/{expected_n} clinical IDs matched; "
+                "stopping rather than comparing different cohorts"
+            )
+        if summary.cases == 0 or summary.controls == 0:
+            raise ValueError(f"chr{chrom}: no cases or controls after genotype matching")
+
+        log.info("chr%s STEP 3/5: Defining biallelic + final-sample QC", chrom)
+        mt = mt.filter_rows(hl.len(mt.alleles) == 2)
+        mt = hl.variant_qc(mt, name="final_qc")
+        mt = mt.filter_rows(
+            (mt.final_qc.call_rate >= (1.0 - MAX_MISSINGNESS)) &
+            (hl.min(mt.final_qc.AF) >= MIN_MAF)
+        )
+        mt = mt.annotate_rows(
+            AF_ALT=mt.final_qc.AF[1],
+            MAF=hl.min(mt.final_qc.AF),
+            CALL_RATE=mt.final_qc.call_rate,
+            N_CALLED=mt.final_qc.n_called,
+        )
+        log.info("chr%s QC rules defined (call rate >=0.85, MAF >=0.01)", chrom)
+
+        log.info("chr%s STEP 4/5: Defining Firth logistic regression", chrom)
+        y = hl.float64(mt.clinical[phenotype_col])
+        covariates = [1.0] + [hl.float64(mt.clinical[col]) for col in covariate_cols]
+        gwas = hl.logistic_regression_rows(
+            test="firth",
+            y=y,
+            x=mt.GT.n_alt_alleles(),
+            covariates=covariates,
+            pass_through=["AF_ALT", "MAF", "CALL_RATE", "N_CALLED"],
+        )
+        gwas = gwas.annotate(
+            FIT_CONVERGED=gwas.fit.converged,
+            FIT_ITERATIONS=gwas.fit.n_iterations,
+            FIT_EXPLODED=gwas.fit.exploded,
+        ).drop("fit")
+
+        log.info("chr%s STEP 5/5: EXECUTING QC + FIRTH GWAS + TSV EXPORT", chrom)
+        log.info("chr%s: Spark stage percentages are NOT total GWAS completion", chrom)
+        gwas.export(output_gcs)
+        # Ensure a successful output exists BEFORE writing a completion marker.
+        if not gcs_exists(output_gcs):
+            raise RuntimeError(f"chr{chrom}: export returned but output file not found")
+        mark_completed(chrom, output_gcs)
+
+        minutes = (time.time() - started) / 60
+        log.info("SUCCESS! chr%s Firth GWAS: %s", chrom, output_gcs)
+        log.info("chr%s completed in %.1f minutes", chrom, minutes)
+        return {"chromosome": chrom, "status": "completed", "minutes": round(minutes, 2), "output": output_gcs}
+    finally:
+        monitor_stop.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=3)
+
+# 6. LOOP CHR1 THROUGH CHR21 — RESUME AND SAVE RESULTS
+
+def main():
+    run_started = time.time()
+    results = []
+    log.info("=" * 65)
+    log.info("STARTING GWAS: CHROMOSOMES 19-21 (chr22 already tested)")
+    log.info("Result directory: %s", RESULT_DIR)
+    log.info("Resuming completed chromosomes: %s", SKIP_COMPLETED)
+    log.info("=" * 65)
+
+    try:
+        try:
+            hl.current_backend()
+            log.info("Using existing Hail backend")
+        except Exception:
+            log.info("Initializing Hail backend")
+            hl.init()
+        sc = hl.spark_context()
+        log.info("Spark application: %s", sc.applicationId)
+        log.info("Spark UI: %s", sc.uiWebUrl)
+
+        ht, phenotype_col, covariate_cols, expected_n = build_clinical_table()
+
+        with tqdm(total=len(CHROMOSOMES), desc="Firth GWAS chr19-21", unit="chr") as bar:
+            for chrom in CHROMOSOMES:
+                bar.set_description(f"Firth GWAS chr{chrom}")
+                if SKIP_COMPLETED:
+                    existing = confirmed_result(chrom)
+                    if existing:
+                        log.info("chr%s ALREADY COMPLETED — SKIPPING: %s", chrom, existing)
+                        results.append({"chromosome": chrom, "status": "skipped_completed", "minutes": None, "output": existing})
+                        bar.update(1)
+                        continue
+                try:
+                    result = run_chromosome(chrom, ht, phenotype_col, covariate_cols, expected_n, sc)
+                except KeyboardInterrupt:
+                    log.warning("INTERRUPTED at chr%s; prior completed chromosomes remain saved", chrom)
+                    raise
+                except Exception:
+                    log.exception("FAILED at chr%s — stopping; rerun to resume", chrom)
+                    results.append({"chromosome": chrom, "status": "failed", "minutes": None, "output": None})
+                    raise
+                results.append(result)
+                bar.update(1)
+                bar.set_postfix(last=f"chr{chrom}", minutes=result["minutes"])
+
+        log.info("ALL 21 CHROMOSOMES COMPLETE!")
+        log.info("Elapsed time: %.1f minutes", (time.time() - run_started) / 60)
+    finally:
+        summary_local = f"{LOCAL_DIR}/gwas_summary_{RUN_ID}.csv"
+        pd.DataFrame(results, columns=["chromosome", "status", "minutes", "output"]).to_csv(summary_local, index=False)
+        log.info("Summary saved locally: %s", summary_local)
+        for handler in log.handlers:
+            handler.flush()
+        for source, target in (
+            (local_log, f"{RESULT_DIR}/gwas_log_{RUN_ID}.txt"),
+            (summary_local, f"{RESULT_DIR}/gwas_summary_{RUN_ID}.csv"),
+        ):
+            try:
+                copy_gcs(source, target)
+            except Exception as exc:
+                log.warning("Could not back up %s: %s", source, exc)
+
+
+main()
+
+
