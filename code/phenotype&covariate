@@ -1,1 +1,38 @@
+library(dplyr)
 
+# 1. Read the two saved datasets
+scd_wgs <- read.csv(
+  "/home/jupyter/workspace/sicklecell_ICD_WGS/scd_wgs_n665.csv"
+)
+
+scd_wgs_l97 <- read.csv(
+  "/home/jupyter/workspace/sicklecell_ICD_WGS_L97/scd_wgs_l97_n38.csv"
+)
+
+# 2. Check sample sizes and unique IDs
+nrow(scd_wgs)
+n_distinct(scd_wgs$person_id)
+
+nrow(scd_wgs_l97)
+n_distinct(scd_wgs_l97$person_id)
+
+phenotype <- scd_wgs %>%
+  distinct(person_id) %>%
+  select(person_id) %>%
+  mutate(
+    leg_ulcer = ifelse(
+      person_id %in% scd_wgs_l97$person_id,
+      1,
+      0
+    )
+  )
+
+head(phenotype)
+dim(phenotype)
+table(phenotype$PHENOTYPE)
+
+write.csv(
+  phenotype,
+  "/home/jupyter/workspace/phenotype_leg_ulcer_n665.csv",
+  row.names = FALSE
+)
