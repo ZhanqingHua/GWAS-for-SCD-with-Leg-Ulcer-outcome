@@ -161,7 +161,7 @@ The following Google Cloud Storage paths refer to analysis workspace data. Acces
 | Summary statistics and analysis outputs | `gs://sicklecell-icd-wgs-wb-rapid-grape-7347/gwas/results/` |
 | Chromosome-specific Hail MatrixTables | `gs://sicklecell-icd-wgs-wb-rapid-grape-7347/gwas/mt_n665/` |
 | Phenotype and covariate inputs | `gs://sicklecell-icd-wgs-wb-rapid-grape-7347/gwas/input/` |
-
+| Pre-PCA preparation (prune and filter) | `gs://sicklecell-icd-wgs-wb-rapid-grape-7347/gwas/pca_n665/`|
 ### Input files
 
 | File | Description |
