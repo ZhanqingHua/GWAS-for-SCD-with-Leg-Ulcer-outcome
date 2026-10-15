@@ -13,14 +13,14 @@ import requests
 from tqdm.auto import tqdm
 
 
-#1. CONFIGURATION — ONLY CHR 1-21 (CHR22 ALREADY COMPLETED)
+#1. CONFIGURATION — ONLY CHR 1-22
 
 BUCKET = "gs://sicklecell-icd-wgs-wb-rapid-grape-7347"
 INPUT_DIR = f"{BUCKET}/gwas/mt_n665"
 PHENO_GCS = f"{BUCKET}/gwas/input/phenotype_leg_ulcer_n665.csv"
 COVAR_GCS = f"{BUCKET}/gwas/input/SCD_GWAS_covar_HU_withAge.tsv"
 
-CHROMOSOMES = list(range(19, 22))  
+CHROMOSOMES = list(range(1, 23))  
 RESULT_DIR = f"{BUCKET}/gwas/results/firth_age_chr1_21_v1"
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 LOCAL_DIR = f"/tmp/scd_gwas_chr1_21_{RUN_ID}"
